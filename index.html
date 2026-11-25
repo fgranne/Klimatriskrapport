@@ -386,8 +386,8 @@ function monthlyMeans(time, values) {
 async function limitKind(r) {
   try { const t = (await r.json()).reason || ""; return /daily/i.test(t) ? "day" : /hourly/i.test(t) ? "hour" : "minute"; } catch (e) { return "minute"; }
 }
-const ERA5_CACHE_VER = "era5-v3:";
-const ERA5_NONE = { rh: null, soil: null, cold: null, rot: null, heat: null, wind: null, years: null };
+const ERA5_CACHE_VER = "era5-v5:";
+const ERA5_NONE = { rh: null, soil: null, cold: null, rot: null, mould: null, heat: null, wind: null, years: null };
 const era5Mem = new Map();
 const era5Key = (lat, lon) => ERA5_CACHE_VER + (Math.round(lat * 50) / 50).toFixed(2) + "," + (Math.round(lon * 50) / 50).toFixed(2);
 async function era5(lat, lon) {
@@ -409,7 +409,7 @@ async function era5(lat, lon) {
     const soil = SOIL_LAYERS.map(([k, label]) => { const m = monthlyMeans(d.daily.time, d.daily[k]); return m && { ...m, label }; });
     const safe = f => { try { return f(d.daily); } catch (e) { return null; } };   // ett fel i en beräkning visas som saknat värde
     const v = { rh: monthlyMeans(d.daily.time, d.daily.relative_humidity_2m_mean), soil: soil.every(Boolean) ? soil : null,
-      cold: safe(coldStats), rot: safe(rotStats), heat: safe(heatStats), wind: safe(windStats), years: safe(yearStats) };
+      cold: safe(coldStats), rot: safe(rotStats), mould: safe(mouldStats), heat: safe(heatStats), wind: safe(windStats), years: safe(yearStats) };
     if (v.rh || v.soil || v.cold) {
       era5Mem.set(key, v);
       try { localStorage.setItem(key, JSON.stringify(v)); } catch (e) { /* full eller blockerad lagring */ }
@@ -480,6 +480,35 @@ function rotStats(daily, minYears = 25) {
   return {
     mean: vals.reduce((s, v) => s + v.idx, 0) / vals.length, max: vals[0], min: vals[vals.length - 1],
     wetDays: full.reduce((s, [, Y]) => s + Y.wet, 0) / full.length, n: vals.length,
+  };
+}
+
+// Mögelgynnsamma dygn: dygnsmedeltemperatur minst MOULD_T och dygnsmedel av relativ fuktighet minst MOULD_RH.
+// Förenklad klimatindikator för utomhusluften (påväxt kräver normalt flera sådana dygn i följd), inte en mögelmodell.
+const MOULD_T = 10, MOULD_T2 = 15, MOULD_RH = 80;   // MOULD_T2: extra uppgift om de mest gynnsamma dygnen
+function mouldStats(daily, minYears = 25) {
+  const { time, temperature_2m_mean: tm, relative_humidity_2m_mean: rh } = daily;
+  if (!rh) return null;
+  const yr = {}, mon = Array(12).fill(0);
+  let run = 0, runYear = null;
+  const endRun = () => { if (run > 0 && run > yr[runYear].longest) yr[runYear].longest = run; run = 0; };
+  time.forEach((t, i) => {
+    const y = +t.slice(0, 4);
+    const Y = yr[y] || (yr[y] = { n: 0, d: 0, d2: 0, longest: 0 });
+    if (tm[i] === null || rh[i] === null) { endRun(); return; }
+    Y.n++;
+    if (tm[i] >= MOULD_T && rh[i] >= MOULD_RH) { Y.d++; if (tm[i] >= MOULD_T2) Y.d2++; mon[+t.slice(5, 7) - 1]++; if (run === 0) runYear = y; run++; } else endRun();
+  });
+  endRun();
+  const full = Object.entries(yr).filter(([, Y]) => Y.n >= 360).map(([y, Y]) => ({ y: +y, ...Y }));
+  if (full.length < minYears) return null;
+  const avg = f => full.reduce((s, Y) => s + f(Y), 0) / full.length;
+  const byDays = [...full].sort((a, b) => b.d - a.d);
+  const total = mon.reduce((a, b) => a + b, 0);
+  return {
+    days: avg(Y => Y.d * 365.25 / Y.n), days2: avg(Y => Y.d2 * 365.25 / Y.n), longest: avg(Y => Y.longest),
+    max: { y: byDays[0].y, d: byDays[0].d }, min: { y: byDays[byDays.length - 1].y, d: byDays[byDays.length - 1].d },
+    months: total ? mon.map(m => m / total) : null, n: full.length,
   };
 }
 
@@ -918,7 +947,7 @@ async function show(place, refresh = false) {
     future(place.lat, place.lon),
   ]);
   if (id !== runId) return;
-  const { rh, cold, rot, heat, wind, years } = era;
+  const { rh, cold, rot, mould, heat, wind, years } = era;
   const limitMsg = l => "<span class='warn'>" + (l === "minute"
     ? "Open-Meteo tillåter bara ett begränsat antal hämtningar per minut. Värdena hämtas automatiskt om en minut."
     : "Open-Meteos gräns för antal hämtningar per " + (l === "day" ? "dygn" : "timme") + " från den här anslutningen är nådd. Försök igen " + (l === "day" ? "i morgon" : "om en timme") + ".") + "</span>";
@@ -1035,6 +1064,10 @@ async function show(place, refresh = false) {
     r.push(row("Rötklimatindex (Scheffer)", rot ? "<span class='val'>" + num(rot.mean, 0) + "</span>" + rotBadge(rot.mean) +
       "<small>Klimatets inverkan på röta i trä ovan mark som utsätts för väder. Under 35 låg, 35–65 måttlig, över 65 hög risk. Lägst " +
       num(rot.min.idx, 0) + " (" + rot.min.y + "), högst " + num(rot.max.idx, 0) + " (" + rot.max.y + "). " + src5 + ".</small>" : eraMiss));
+    r.push(row("Mögelgynnsamma dygn", mould ? "<span class='val'>" + num(mould.days, 0) + " dygn</span> per år, varav " +
+      (mould.days2 < 0.5 ? "färre än 1" : num(mould.days2, 0)) + " med minst " + MOULD_T2 + " °C<small>Dygnsmedel minst " + MOULD_T +
+      " °C och " + MOULD_RH + " % RF. Dygnen med minst " + MOULD_T2 + " °C är de mest gynnsamma. Längsta period i snitt " + num(mould.longest, 0) + " dygn per år. Flest " + mould.max.d + " (" + mould.max.y +
+      "), minst " + mould.min.d + " (" + mould.min.y + "). Förenklad indikator för utomhusluften, för att jämföra orter. " + src5 + ".</small>" : eraMiss));
     const img = $("mapimg-tpl").innerHTML;
     sec("Fukt och slagregn", "Fuktbelastning på klimatskärmen och trä utomhus.",
       "<div class='fuktgrid'>" + table(r) + "<div class='map'><div class='frame'>" + img +
